@@ -21,9 +21,7 @@ class MAVLinkSocket:
         self.drone_ip = None
         self.drone_port = None
 
-    # Used in order to discover the drone
-    # Drone will send a datagram and we will receive it as GCS
-    def receive_broadcast(self):
+    def receive_datagram(self):
         try:
             data, addr = self.udp_socket.recvfrom(BUFFER_SIZE)
             return data.decode(), addr

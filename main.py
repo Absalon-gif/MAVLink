@@ -1,5 +1,7 @@
 import sys
-from PyQt5.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QPushButton, QTextEdit, QLabel, QMessageBox
+import subprocess
+import time
+from PyQt5.QtWidgets import QApplication, QLineEdit,QMainWindow, QWidget, QVBoxLayout, QPushButton, QTextEdit, QLabel, QMessageBox
 from src.MAVLink.mav_message import MAVLinkXMLParser
 from src.MAVLink.mav_connection import MAVLinkSocket, MAVLinkRadioCommunicator
 
@@ -51,16 +53,20 @@ class GCSApp(QMainWindow):
         self.title_label.setStyleSheet("font-size: 16pt; font-weight: bold;")
         layout.addWidget(self.title_label)
 
+        self.ssid_input = QLineEdit(self)
+        self.ssid_input.setPlaceholderText("Enter Drone's SSID")
+        layout.addWidget(self.ssid_input)
+
+        self.connect_button = QPushButton('Connect to Drone', self)
+        self.connect_button.clicked.connect(self.connect_to_drone)
+        layout.addWidget(self.connect_button)
+
         self.drone_info_label = QLabel('Drone not discovered yet', self)
         layout.addWidget(self.drone_info_label)
 
         self.send_heartbeat_button = QPushButton('Send Heartbeat Message', self)
         self.send_heartbeat_button.clicked.connect(self.send_heartbeat)
         layout.addWidget(self.send_heartbeat_button)
-
-        self.receive_broadcast_button = QPushButton('Receive Broadcast', self)
-        self.receive_broadcast_button.clicked.connect(self.receive_broadcasts)
-        layout.addWidget(self.receive_broadcast_button)
 
         self.logs_text = QTextEdit(self)
         self.logs_text.setReadOnly(True)
@@ -70,6 +76,28 @@ class GCSApp(QMainWindow):
 
     def log(self, message):
         self.logs_text.append(message)
+
+    def connect_to_drone(self):
+        ssid = self.ssid_input.text()
+        if ssid:
+            self.logs_text.append(f"Attempting to connect to Drone with SSID: {ssid}")
+            # Turn Wi-Fi off
+            subprocess.run(["networksetup", "-setairportpower", "en0", "off"])
+            time.sleep(1)
+
+            # Turn Wi-Fi on
+            subprocess.run(["networksetup", "-setairportpower", "en0", "on"])
+            time.sleep(1)
+
+            # Connect to the hidden SSID
+            subprocess.run(["networksetup", "-setairportnetwork", "en0", ssid])
+            time.sleep(5)
+
+            connection_status = subprocess.run(["networksetup", "-getairportnetwork", "en0"], capture_output=True, text=True)
+            if ssid in connection_status.stdout:
+                print(f"Successfully connected to {ssid}")
+            else:
+                print(f"Failed to connect to {ssid}")
 
     def receive_broadcasts(self):
         while self.listen_broadcast:
