@@ -1,34 +1,41 @@
 import sys
 import subprocess
 import time
-from PyQt5.QtWidgets import QApplication, QLineEdit,QMainWindow, QWidget, QVBoxLayout, QPushButton, QTextEdit, QLabel, QMessageBox
-from src.MAVLink.mav_message import MAVLinkXMLParser
-from src.MAVLink.mav_connection import MAVLinkSocket, MAVLinkRadioCommunicator
+import threading
+from PyQt5.QtCore import pyqtSignal, QObject
+from PyQt5.QtWidgets import QApplication, QLineEdit, QMainWindow, QWidget, QVBoxLayout, QPushButton, QTextEdit, QLabel, \
+    QMessageBox
+from src.MAVLink.mav_connection import MAVLinkSocket, MAVLinkRadioCommunicator, AccessControl
+from src.MAVLink.mav_message import MAVLinkMessageCreator
 
-prelim_values = {
-    'type': 0,  # MAV_TYPE: Generic micro air vehicle
-    'autopilot': 1,  # MAV_AUTOPILOT: Reserved for future use.
-    'base_mode': 0,  # MAV_MODE_FLAG: (Bitmask) These flags encode the MAV mode.
-    'custom_mode': 0,  # A bitfield for use for autopilot-specific flags
-    'system_status': 0,  # MAV_STATE: System status flag.
-    'mavlink_version': 3  # MAVLink version
+
+heartbeat_values = {
+    'type': 0,
+    'autopilot': 1,
+    'base_mode': 0,
+    'custom_mode': 0,
+    'system_status': 0,
+    'mavlink_version': 3
 }
 
-parser = MAVLinkXMLParser()
-messages = parser.parse_file('message_definitions/common.xml')
+status_values = {
+    'onboard_control_sensors_health': 1,
+    'load': 500,
+    'current_battery': 30,
+    'battery_remaining': 45
+}
 
-heartbeat_message = next(message for message in messages if message.message_id == 0)
+home_position_values = {
+    'latitude': 1,
+    'longitude': 500,
+    'altitude': 30,
+}
 
 
-class AccessControl:
-    def __init__(self):
-        self.authorized_system_ids = set()
-
-    def configure_access(self, system_ids: list[int]):
-        self.authorized_system_ids.update(system_ids)
-
-    def is_authorized(self, system_id: int) -> bool:
-        return system_id in self.authorized_system_ids
+class WorkerSignals(QObject):
+    log = pyqtSignal(str)
+    update_drone_info = pyqtSignal(str, str, str)
+    heartbeat_sent = pyqtSignal()
 
 
 class GCSApp(QMainWindow):
@@ -37,10 +44,18 @@ class GCSApp(QMainWindow):
 
         self.mav_socket = mav_socket
         self.mav_communicator = MAVLinkRadioCommunicator(mav_socket)
-        self.access_control = AccessControl()
+        self.listen_broadcast = True
+        self.listen_thread = None
+
+        # Set up signals
+        self.signals = WorkerSignals()
+
+        # Connect signals to slots
+        self.signals.log.connect(self.log)
+        self.signals.update_drone_info.connect(self.update_drone_info)
+        self.signals.heartbeat_sent.connect(self.handle_heartbeat_sent)
 
         self.initUI()
-        self.listen_broadcast = True
 
     def initUI(self):
         self.setWindowTitle('GCS - Ground Control Station')
@@ -59,6 +74,10 @@ class GCSApp(QMainWindow):
 
         self.connect_button = QPushButton('Connect to Drone', self)
         self.connect_button.clicked.connect(self.connect_to_drone)
+        layout.addWidget(self.connect_button)
+
+        self.connect_button = QPushButton('Receive Broadcast', self)
+        self.connect_button.clicked.connect(self.start_listening_thread)
         layout.addWidget(self.connect_button)
 
         self.drone_info_label = QLabel('Drone not discovered yet', self)
@@ -80,58 +99,63 @@ class GCSApp(QMainWindow):
     def connect_to_drone(self):
         ssid = self.ssid_input.text()
         if ssid:
-            self.logs_text.append(f"Attempting to connect to Drone with SSID: {ssid}")
-            # Turn Wi-Fi off
+            self.signals.log.emit(f"Attempting to connect to Drone with SSID: {ssid}")
             subprocess.run(["networksetup", "-setairportpower", "en0", "off"])
             time.sleep(1)
-
-            # Turn Wi-Fi on
             subprocess.run(["networksetup", "-setairportpower", "en0", "on"])
             time.sleep(1)
-
-            # Connect to the hidden SSID
             subprocess.run(["networksetup", "-setairportnetwork", "en0", ssid])
             time.sleep(5)
-
-            connection_status = subprocess.run(["networksetup", "-getairportnetwork", "en0"], capture_output=True, text=True)
+            connection_status = subprocess.run(["networksetup", "-getairportnetwork", "en0"], capture_output=True,
+                                               text=True)
             if ssid in connection_status.stdout:
-                print(f"Successfully connected to {ssid}")
+                self.signals.log.emit(f"Connected to Drone with SSID: {ssid}")
+                self.start_listening_thread()
             else:
-                print(f"Failed to connect to {ssid}")
+                self.signals.log.emit(f"Failed to connect to {ssid}")
 
-    def receive_broadcasts(self):
-        while self.listen_broadcast:
+    def start_listening_thread(self):
+        if self.listen_thread is None or not self.listen_thread.is_alive():
+            self.listen_thread = threading.Thread(target=self.listen_for_datagrams)
+            self.listen_thread.start()
+
+    def listen_for_datagrams(self):
+        while True:
             try:
-                data, (drone_ip, drone_port) = self.mav_socket.receive_broadcast()
+                data, (drone_ip, drone_port) = self.mav_socket.receive_datagram()
                 if drone_ip and drone_port:
-                    self.mav_socket.drone_ip = drone_ip
-                    self.mav_socket.drone_port = drone_port
-                    self.access_control.configure_access(data)
-                    print(f"Discovered drone at {drone_ip}:{drone_port}, with SYS_ID: {data}")
-                    self.send_heartbeat()
-                    self.log(f"Discovered drone at {drone_ip}:{drone_port}, with SYS_ID: {data}")
-                    self.update_drone_info(drone_ip, drone_port, data)
-                    self.listen_broadcast = False
-                    break
+                    if self.listen_broadcast is False:
+                        self.mav_communicator.receive_message(data)
+                    if not self.mav_socket.drone_ip and not self.mav_socket.drone_port:
+                        self.mav_socket.drone_ip = drone_ip
+                        self.mav_socket.drone_port = drone_port
+                        self.mav_socket.host = MAVLinkSocket.get_ipaddr()
+                        print(f"Discovered drone at {drone_ip}:{drone_port}, with SYS_ID: {data}")
+                        self.send_heartbeat()
+                        self.signals.log.emit(f"Discovered drone at {drone_ip}:{drone_port}, with SYS_ID: {data}")
+                        self.update_drone_info(drone_ip, drone_port, data)
+                        self.listen_broadcast = False
             except Exception as e:
-                print(f"Error receiving broadcast: {e}")
-                self.log(f"Error receiving broadcast: {e}")
+                self.signals.log.emit(f"Error receiving datagram: {e}")
 
     def update_drone_info(self, drone_ip, drone_port, data):
         print(f"Updating drone info: {drone_ip}:{drone_port}, with SYS_ID: {data}")
-        self.log(f"Discovered drone at {drone_ip}:{drone_port}, with SYS_ID: {data}")
+        self.signals.log.emit(f"Discovered drone at {drone_ip}:{drone_port}, with SYS_ID: {data}")
         self.drone_info_label.setText(f"Discovered drone at {drone_ip}:{drone_port}")
-        self.log(f"Updated drone info: {drone_ip}:{drone_port}, with SYS_ID: {data}")
+        self.signals.log.emit(f"Updated drone info: {drone_ip}:{drone_port}, with SYS_ID: {data}")
 
     def send_heartbeat(self):
+        mav_message = MAVLinkMessageCreator().create_message(0)
         try:
-            self.mav_communicator.send_message(heartbeat_message, prelim_values,
+            self.mav_communicator.send_message(mav_message, heartbeat_values,
                                                self.mav_socket.drone_ip, self.mav_socket.drone_port)
-            self.log("Heartbeat message sent")
-            QMessageBox.information(self, "Info", "Heartbeat message sent")
+            self.signals.log.emit("Heartbeat message sent")
+            self.signals.heartbeat_sent.emit()
         except Exception as e:
-            self.log(f"Failed to send heartbeat message: {e}")
-            QMessageBox.critical(self, "Error", f"Failed to send heartbeat message: {e}")
+            self.signals.log.emit(f"Failed to send heartbeat message: {e}")
+
+    def handle_heartbeat_sent(self):
+        QMessageBox.information(self, "Info", "Heartbeat message sent")
 
 
 if __name__ == "__main__":
